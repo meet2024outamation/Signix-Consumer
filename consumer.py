@@ -13,7 +13,8 @@ RABBITMQ_USER = "guest"
 RABBITMQ_PASS = "guest"           
 QUEUE_NAME = "signix-docsign"      
 ACK_QUEUE = "signix-docsign-ack" 
-
+# Base directory where incoming and signed PDFs reside. Use raw string to avoid backslash escapes.
+PDF_PATH = r"C:\Users\meet.patel\Learning\Esign Task\Signix"
 def base64_to_image(base64_string):
     """Convert base64 string to PIL Image"""
     try:
@@ -45,6 +46,7 @@ def find_text_in_pdf(doc, search_text):
 
 def apply_signatures_to_pdf(pdf_path, signed_pdf_path, signers, sign_data, doc_tags, font_coords=None):
     """Apply signatures to PDF document by finding tags directly in PDF"""
+    error_messages = []
     try:
         # Open the PDF document
         doc = fitz.open(pdf_path)
@@ -60,7 +62,9 @@ def apply_signatures_to_pdf(pdf_path, signed_pdf_path, signers, sign_data, doc_t
             tag_instances = find_text_in_pdf(doc, tag)
             
             if not tag_instances:
-                print(f"⚠️ Tag '{tag}' not found in PDF")
+                error_msg = f"Tag '{tag}' not found in PDF"
+                print(f"⚠️ {error_msg}")
+                error_messages.append(error_msg)
                 continue
             
             print(f"📍 Found {len(tag_instances)} instance(s) of tag {tag}")
@@ -96,45 +100,52 @@ def apply_signatures_to_pdf(pdf_path, signed_pdf_path, signers, sign_data, doc_t
                 # Find all instances of the sign tag in the PDF
                 tag_instances = find_text_in_pdf(doc, sign_tag)
                 
-                if tag_instances:
-                    print(f"📍 Found {len(tag_instances)} instance(s) of signature tag {sign_tag}")
+                if not tag_instances:
+                    error_msg = f"Sign tag '{sign_tag}' not found in PDF"
+                    print(f"⚠️ {error_msg}")
+                    error_messages.append(error_msg)
+                    continue
+                
+                print(f"📍 Found {len(tag_instances)} instance(s) of signature tag {sign_tag}")
+                
+                sign_image = base64_to_image(base64_data)
+                if not sign_image:
+                    error_msg = f"Failed to convert base64 signature data for tag '{sign_tag}'"
+                    error_messages.append(error_msg)
+                    continue
+                
+                # Save signature as temporary image
+                temp_sig_path = f"temp_main_signature_{sign_tag.replace('[', '').replace(']', '').replace('_', '')}.png"
+                sign_image.save(temp_sig_path, "PNG")
+                
+                # Process ALL instances of the signature tag found
+                for i, tag_instance in enumerate(tag_instances):
+                    page_num = tag_instance['page']
+                    tag_rect = tag_instance['rect']
                     
-                    sign_image = base64_to_image(base64_data)
-                    if sign_image:
-                        # Save signature as temporary image
-                        temp_sig_path = f"temp_main_signature_{sign_tag.replace('[', '').replace(']', '').replace('_', '')}.png"
-                        sign_image.save(temp_sig_path, "PNG")
-                        
-                        # Process ALL instances of the signature tag found
-                        for i, tag_instance in enumerate(tag_instances):
-                            page_num = tag_instance['page']
-                            tag_rect = tag_instance['rect']
-                            
-                            # Get the page
-                            page = doc[page_num]
-                            
-                            # Create signature rectangle
-                            sig_width = max(tag_rect.width, 150)
-                            sig_height = max(tag_rect.height, 40)
-                            
-                            # Position signature at the tag location
-                            sig_x = tag_rect.x0
-                            sig_y = tag_rect.y0
-                            
-                            signature_rect = fitz.Rect(sig_x, sig_y, sig_x + sig_width, sig_y + sig_height)
-                            
-                            # Insert signature image
-                            page.insert_image(signature_rect, filename=temp_sig_path)
-                            
-                            print(f"✅ Applied main signature for {sign_tag} instance {i+1}/{len(tag_instances)} at page {page_num + 1}")
-                        
-                        applied_signatures.add(sign_tag)
-                        
-                        # Clean up temporary file
-                        if os.path.exists(temp_sig_path):
-                            os.remove(temp_sig_path)
-                else:
-                    print(f"⚠️ Sign tag '{sign_tag}' not found in PDF")
+                    # Get the page
+                    page = doc[page_num]
+                    
+                    # Create signature rectangle
+                    sig_width = max(tag_rect.width, 150)
+                    sig_height = max(tag_rect.height, 40)
+                    
+                    # Position signature at the tag location
+                    sig_x = tag_rect.x0
+                    sig_y = tag_rect.y0
+                    
+                    signature_rect = fitz.Rect(sig_x, sig_y, sig_x + sig_width, sig_y + sig_height)
+                    
+                    # Insert signature image
+                    page.insert_image(signature_rect, filename=temp_sig_path)
+                    
+                    print(f"✅ Applied main signature for {sign_tag} instance {i+1}/{len(tag_instances)} at page {page_num + 1}")
+                
+                applied_signatures.add(sign_tag)
+                
+                # Clean up temporary file
+                if os.path.exists(temp_sig_path):
+                    os.remove(temp_sig_path)
         
         # Handle signer signature images if they have base64SignData
         # for signer in signers:
@@ -193,28 +204,41 @@ def apply_signatures_to_pdf(pdf_path, signed_pdf_path, signers, sign_data, doc_t
         doc.close()
         
         print(f"✅ Signed PDF saved: {signed_pdf_path}")
-        return True
+        return True, error_messages
         
     except Exception as e:
-        print(f"❌ Error applying signatures to PDF: {e}")
-        return False
+        error_msg = f"Error applying signatures to PDF: {str(e)}"
+        print(f"❌ {error_msg}")
+        error_messages.append(error_msg)
+        return False, error_messages
 
-
+def resolve_path(base, path):
+    if not path:
+        return base
+    # Treat as absolute only if it has a drive letter (Windows) or starts with /
+    # if os.path.isabs(path) and (os.path.splitdrive(path)[0] or path.startswith('/')):
+    #     return path
+    return os.path.join(base, path.lstrip('/\\'))
 def process_document_signing(message):
     """Process the document signing message"""
     try:
         signing_room_id = message.get('signingRoomId')
         original_path = message.get('originalPath', '')
         signed_path = message.get('signedPath', '')
+
+        # Combine provided relative paths with base PDF_PATH if they are not absolute
+        original_path = resolve_path(PDF_PATH, original_path)
+        print("Original Path:", original_path)
+        signed_path = resolve_path(PDF_PATH, signed_path) if signed_path else original_path
         sign_data = message.get('signData', {})
         signers = message.get('signers', [])
         signed_documents = message.get('signedDocuments', [])
         
         print(f"🔄 Processing signing room ID: {signing_room_id}")
         
-        # If signed_path is empty, use original_path with "signed_" prefix
-        if not signed_path:
-            signed_path = original_path
+        # # If signed_path is empty, use original_path with "signed_" prefix
+        # if not signed_path:
+        #     signed_path = original_path
         
         processed_documents = []
         
@@ -222,44 +246,80 @@ def process_document_signing(message):
         for document in signed_documents:
             doc_name = document.get('name')
             doc_tags = document.get('docTags', {})
+            error_messages = []
             
-            # Construct file paths
-            original_file_path = os.path.join(original_path.lstrip('/'), doc_name)
-            signed_file_path = os.path.join(signed_path.lstrip('/'), f"signed_{doc_name}")
-            
-            print(f"📄 Processing document: {doc_name}")
-            print(f"📂 Original path: {original_file_path}")
-            print(f"📂 Signed path: {signed_file_path}")
-            
-            # Check if original file exists
-            if not os.path.exists(original_file_path):
-                print(f"❌ Original file not found: {original_file_path}")
-                continue
-            
-            # Apply signatures to PDF (no longer needs font_coords parameter)
-            success = apply_signatures_to_pdf(
-                original_file_path, 
-                signed_file_path, 
-                signers, 
-                sign_data, 
-                doc_tags
-            )
-            
-            if success:
+            try:
+                # Construct file paths
+                original_file_path = os.path.join(original_path, doc_name)
+                signed_file_path = os.path.join(signed_path, doc_name)
+                
+                print(f"📄 Processing document: {doc_name}")
+                print(f"📂 Original path: {original_file_path}")
+                print(f"📂 Signed path: {signed_file_path}")
+                
+                # Check if original file exists
+                if not os.path.exists(original_file_path):
+                    error_message = f"Original file not found: {original_file_path}"
+                    print(f"❌ {error_message}")
+                    error_messages.append(error_message)
+                    processed_documents.append({
+                        'name': doc_name,
+                        'original_path': original_file_path,
+                        'signed_path': signed_file_path,
+                        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                        'status': 'failed',
+                        'error_messages': error_messages
+                    })
+                    continue
+                
+                # Apply signatures to PDF (no longer needs font_coords parameter)
+                success, pdf_errors = apply_signatures_to_pdf(
+                    original_file_path, 
+                    signed_file_path, 
+                    signers, 
+                    sign_data, 
+                    doc_tags
+                )
+                
+                # Add any PDF processing errors to our error list
+                if pdf_errors:
+                    error_messages.extend(pdf_errors)
+                
+                if success:
+                    # Include error_messages even for successful documents (may contain warnings like tag not found)
+                    doc_result = {
+                        'name': doc_name,
+                        'original_path': original_file_path,
+                        'signed_path': signed_file_path,
+                        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                        'status': 'completed'
+                    }
+                    if error_messages:
+                        doc_result['error_messages'] = error_messages
+                    processed_documents.append(doc_result)
+                else:
+                    if not error_messages:
+                        error_messages.append("PDF signature application failed - check logs for details")
+                    processed_documents.append({
+                        'name': doc_name,
+                        'original_path': original_file_path,
+                        'signed_path': signed_file_path,
+                        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                        'status': 'failed',
+                        'error_messages': error_messages
+                    })
+                    
+            except Exception as e:
+                error_message = f"Document processing error: {str(e)}"
+                print(f"❌ Error processing document {doc_name}: {e}")
+                error_messages.append(error_message)
                 processed_documents.append({
                     'name': doc_name,
-                    'original_path': original_file_path,
-                    'signed_path': signed_file_path,
+                    'original_path': original_file_path if 'original_file_path' in locals() else 'unknown',
+                    'signed_path': signed_file_path if 'signed_file_path' in locals() else 'unknown',
                     'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-                    'status': 'completed'
-                })
-            else:
-                processed_documents.append({
-                    'name': doc_name,
-                    'original_path': original_file_path,
-                    'signed_path': signed_file_path,
-                    'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-                    'status': 'failed'
+                    'status': 'failed',
+                    'error_messages': error_messages
                 })
         
         return {
